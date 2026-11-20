@@ -1,0 +1,409 @@
+// @vitest-environment node
+import {
+    APICallError,
+    InvalidToolInputError,
+    RetryError,
+    simulateReadableStream,
+    streamText,
+    TypeValidationError,
+    tool,
+} from "ai"
+import { MockLanguageModelV3 } from "ai/test"
+import { describe, expect, it } from "vitest"
+import { z } from "zod"
+import {
+    classifyLLMError,
+    isToolCallError,
+    logText,
+    streamErrorText,
+} from "@/lib/llm-errors"
+
+// data: the body as the provider's error format, when it is in that format
+const apiError = (
+    statusCode: number,
+    message: string,
+    responseBody = "",
+    data?: unknown,
+) =>
+    new APICallError({
+        message,
+        url: "https://api.example.com/v1/chat/completions",
+        requestBodyValues: {},
+        statusCode,
+        responseBody,
+        data,
+    })
+
+describe("classifyLLMError", () => {
+    it("reads the status code, not the message", () => {
+        // Providers rarely put the number in their message
+        expect(
+            classifyLLMError(apiError(401, "Authentication Fails")).code,
+        ).toBe("invalid_api_key")
+        expect(
+            classifyLLMError(
+                apiError(404, "Unknown", "", { error: { message: "Unknown" } }),
+            ).code,
+        ).toBe("model_not_found")
+        expect(classifyLLMError(apiError(503, "busy")).code).toBe(
+            "provider_unavailable",
+        )
+    })
+
+    it("points to the base URL for a 404 that is not the provider's error", () => {
+        // A base URL without its /v1: the web server's own 404, here
+        // FastAPI's
+        const notFound = apiError(404, "Not Found", '{"detail":"Not Found"}')
+        expect(classifyLLMError(notFound)).toEqual({
+            type: "provider",
+            code: "wrong_base_url",
+            message: "Not Found: Not Found",
+        })
+        // A plain 404 that names the model is about the model
+        expect(
+            classifyLLMError(apiError(404, "model 'acme-large' not found"))
+                .code,
+        ).toBe("model_not_found")
+    })
+
+    it("lets a specific text win over the status code", () => {
+        expect(
+            classifyLLMError(
+                apiError(429, "You exceeded your current quota, check billing"),
+            ).code,
+        ).toBe("insufficient_quota")
+        expect(
+            classifyLLMError(
+                apiError(400, "This model's maximum context length is 128000"),
+            ).code,
+        ).toBe("context_too_long")
+        expect(
+            classifyLLMError(
+                apiError(400, "bad", '{"message":"toolUse.input is invalid"}'),
+            ).code,
+        ).toBe("output_truncated")
+        // OpenRouter, for a model that reads no images
+        expect(
+            classifyLLMError(
+                apiError(404, "No endpoints found that support image input"),
+            ).code,
+        ).toBe("images_unsupported")
+    })
+
+    it("says the image is the problem when the provider could not read it", () => {
+        // Bedrock, for a HEIC photo sent as JPEG. On the server's keys the
+        // user gets the code only, which the chat turns into its hint.
+        const error = apiError(
+            400,
+            "The model returned the following errors: image processing failed: cannot measure image dimensions: The image format could not be determined",
+        )
+        expect(JSON.parse(streamErrorText(error, true))).toEqual({
+            type: "provider",
+            code: "image_unreadable",
+            message: "The provider returned an error.",
+        })
+    })
+
+    it("does not call a 403 an invalid key", () => {
+        expect(classifyLLMError(apiError(403, "Forbidden")).code).toBe(
+            "forbidden",
+        )
+    })
+
+    it("names a wrong key that does not come as 401", () => {
+        // Google: 400, with the reason in the body
+        const google = apiError(
+            400,
+            "API key not valid. Please pass a valid API key.",
+            '{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}',
+        )
+        // Bedrock: 403 for a wrong access key ID or secret access key
+        const awsKeyId = apiError(
+            403,
+            "The security token included in the request is invalid.",
+        )
+        const awsSecret = apiError(
+            403,
+            "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method.",
+        )
+        for (const error of [google, awsKeyId, awsSecret]) {
+            expect(classifyLLMError(error).code).toBe("invalid_api_key")
+        }
+    })
+
+    it("points to the model id when Bedrock does not know it", () => {
+        const error = apiError(400, "The provided model identifier is invalid.")
+        expect(classifyLLMError(error).code).toBe("model_not_found")
+    })
+
+    it("uses the last attempt after retries", () => {
+        const retry = new RetryError({
+            message: "Failed after 3 attempts",
+            reason: "maxRetriesExceeded",
+            errors: [apiError(500, "x"), apiError(429, "slow down")],
+        })
+        expect(classifyLLMError(retry).code).toBe("rate_limited")
+    })
+
+    it("keeps the message but hides secrets in it", () => {
+        const { code, message } = classifyLLMError(
+            apiError(
+                401,
+                "Incorrect API key provided: sk-proj-abcdefghijklmnop. Header Bearer abc.def",
+            ),
+        )
+        expect(code).toBe("invalid_api_key")
+        expect(message).toContain("Incorrect API key provided")
+        expect(message).not.toContain("abcdefghijklmnop")
+        expect(message).not.toContain("abc.def")
+    })
+
+    it("leaves our own messages readable", () => {
+        // This one used to be replaced by "Authentication failed" for
+        // containing the word key
+        const { message } = classifyLLMError(
+            new Error(
+                "API key is required when using a custom base URL. Please provide your own API key in Settings.",
+            ),
+        )
+        expect(message).toContain("API key is required when using a custom")
+    })
+
+    it("names a timeout", () => {
+        const timeout = new Error("The operation was aborted due to timeout")
+        timeout.name = "TimeoutError"
+        expect(classifyLLMError(timeout).code).toBe("timeout")
+    })
+
+    it("points to the model id when Bedrock wants an inference profile", () => {
+        const error = apiError(
+            400,
+            "Invocation of model ID anthropic.claude-sonnet-5-5 with on-demand throughput isn’t supported. Retry your request with the ID or ARN of an inference profile that contains this model.",
+        )
+        expect(classifyLLMError(error).code).toBe("model_not_found")
+    })
+
+    it("reads Bedrock's token throttling as a rate limit", () => {
+        const error = apiError(
+            429,
+            "Too many tokens, please wait before trying again.",
+        )
+        expect(classifyLLMError(error).code).toBe("rate_limited")
+    })
+
+    it("names a network error the SDK wrapped", () => {
+        const error = new APICallError({
+            message:
+                "Cannot connect to API: Connect Timeout Error (attempted address: api.example.com:443, timeout: 10000ms)",
+            url: "https://api.example.com/v1/chat/completions",
+            requestBodyValues: {},
+        })
+        expect(classifyLLMError(error).code).toBe("cannot_connect")
+    })
+
+    it("names a reply that is not a model API's", () => {
+        // A base URL that points at a website: 200 and a web page
+        expect(
+            classifyLLMError(
+                new Error("Response stream ended without a finish reason."),
+            ).code,
+        ).toBe("bad_response")
+        expect(
+            classifyLLMError(
+                new Error(
+                    'JSON parsing failed: Text: {"id":"x","choices":[{"delta":{"content":"half.\nError message: Unterminated string in JSON at position 58',
+                ),
+            ).code,
+        ).toBe("bad_response")
+        expect(
+            classifyLLMError(apiError(200, "Invalid JSON response")).code,
+        ).toBe("bad_response")
+        // A base URL that points at another API: 200 and JSON of its own
+        expect(
+            classifyLLMError(
+                TypeValidationError.wrap({
+                    value: { status: "ok", data: [] },
+                    cause: new Error("expected choices"),
+                }),
+            ).code,
+        ).toBe("bad_response")
+    })
+
+    it("reads an error object sent in the stream", () => {
+        // OpenRouter, when the upstream provider is overloaded
+        const error = {
+            code: 503,
+            message:
+                "Upstream error from Nvidia: Service temporarily overloaded",
+            metadata: { error_type: "provider_overloaded" },
+        }
+        expect(classifyLLMError(error)).toEqual({
+            type: "provider",
+            code: "provider_unavailable",
+            message:
+                "Upstream error from Nvidia: Service temporarily overloaded",
+        })
+    })
+
+    it("adds the reason from a problem+json body", () => {
+        // NVIDIA, for a retired model; the SDK's message is only "Gone"
+        const body = JSON.stringify({
+            title: "Gone",
+            status: 410,
+            detail: "The model 'deepseek-v4-flash' has reached its end of life",
+        })
+        expect(classifyLLMError(apiError(410, "Gone", body))).toEqual({
+            type: "provider",
+            code: "model_not_found",
+            message:
+                "Gone: The model 'deepseek-v4-flash' has reached its end of life",
+        })
+    })
+})
+
+describe("streamErrorText", () => {
+    it("keeps the text of a tool call the model got wrong", async () => {
+        // Seen with Claude Opus 5.5: a quote left unescaped in the input
+        const model = new MockLanguageModelV3({
+            doStream: (async () => ({
+                stream: simulateReadableStream({
+                    chunks: [
+                        {
+                            type: "tool-call",
+                            toolCallId: "c1",
+                            toolName: "edit_diagram",
+                            input: '{"operations": [{"new_xml": "as="x""}]}',
+                        },
+                        {
+                            type: "finish",
+                            finishReason: {
+                                unified: "tool-calls",
+                                raw: "tool_use",
+                            },
+                            usage: {
+                                inputTokens: { total: 1 },
+                                outputTokens: { total: 1 },
+                            },
+                        },
+                    ],
+                }),
+            })) as any,
+        })
+        const result = streamText({
+            model: model as any,
+            prompt: "edit",
+            tools: {
+                edit_diagram: tool({
+                    inputSchema: z.object({ operations: z.array(z.any()) }),
+                }),
+            },
+        })
+        const errors: string[] = []
+        for await (const chunk of result.toUIMessageStream({
+            onError: streamErrorText,
+        })) {
+            if ("errorText" in chunk) errors.push(chunk.errorText)
+        }
+        expect(errors.length).toBeGreaterThan(0)
+        for (const text of errors) {
+            expect(text).toMatch(/^Invalid input for tool edit_diagram/)
+        }
+    })
+
+    it("hides the provider's text on the server's keys", () => {
+        const error = apiError(
+            403,
+            "User: arn:aws:sts::123456789012:assumed-role/app/s is not authorized to perform: bedrock:InvokeModel",
+        )
+        const hidden = JSON.parse(streamErrorText(error, true))
+        expect(hidden.message).not.toMatch(/arn:aws|123456789012/)
+        expect(JSON.parse(streamErrorText(error)).message).toMatch(
+            /not authorized/,
+        )
+        const throttled = JSON.parse(
+            streamErrorText(apiError(429, "Too many tokens"), true),
+        )
+        expect(throttled).toEqual({
+            type: "provider",
+            code: "rate_limited",
+            message: "The provider returned an error.",
+        })
+    })
+
+    it("names a 403 on the server's keys, e.g. a spend cap blocked them", () => {
+        const error = apiError(403, "explicit deny in an identity-based policy")
+        expect(JSON.parse(streamErrorText(error, true))).toEqual({
+            type: "provider",
+            code: "server_key_forbidden",
+            message: "",
+        })
+        // On the user's own key it stays a plain refusal
+        expect(JSON.parse(streamErrorText(error)).code).toBe("forbidden")
+    })
+
+    it("classifies a provider error", () => {
+        expect(JSON.parse(streamErrorText(apiError(401, "bad key")))).toEqual({
+            type: "provider",
+            code: "invalid_api_key",
+            message: "bad key",
+        })
+    })
+
+    it("classifies a provider error sent as plain text", () => {
+        // DeepSeek's SDK sends errors in the stream as a string
+        const text = "Insufficient Balance for account 42"
+        expect(JSON.parse(streamErrorText(text))).toEqual({
+            type: "provider",
+            code: "insufficient_quota",
+            message: text,
+        })
+        expect(JSON.parse(streamErrorText(text, true)).message).not.toMatch(
+            /account 42/,
+        )
+    })
+
+    it("classifies Bedrock's throttling sent in the stream", () => {
+        // Bedrock's ThrottlingException as a plain object, not an API error
+        const throttled = {
+            message: "Too many tokens, please wait before trying again.",
+        }
+        expect(JSON.parse(streamErrorText(throttled)).code).toBe("rate_limited")
+    })
+})
+
+describe("logText", () => {
+    // Some gateways answer a wrong key with the whole key in the text
+    const echoed = apiError(
+        401,
+        "Incorrect API key provided: my-own-key-12345. Check your key.",
+        '{"error":{"message":"Incorrect API key provided: my-own-key-12345"}}',
+    )
+
+    it("keeps a key the provider echoed back out of the server log", () => {
+        const text = logText(echoed)
+        expect(text).not.toContain("my-own-key-12345")
+        expect(text).toContain("Incorrect API key provided: [redacted]")
+        // The rest of the error is there as before
+        expect(text).toContain("statusCode: 401")
+        expect(classifyLLMError(echoed).message).toBe(
+            "Incorrect API key provided: [redacted] Check your key.",
+        )
+    })
+
+    it("leaves the key OpenAI masks itself", () => {
+        const masked = "Incorrect API key provided: sk-proj-********1234."
+        expect(logText(masked)).toBe(masked)
+    })
+})
+
+describe("isToolCallError", () => {
+    it("spots errors the model must see unchanged", () => {
+        const invalid = new InvalidToolInputError({
+            toolName: "display_diagram",
+            toolInput: "{",
+            cause: new Error("bad JSON"),
+        })
+        expect(isToolCallError(invalid)).toBe(true)
+        expect(isToolCallError(apiError(500, "x"))).toBe(false)
+    })
+})
