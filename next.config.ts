@@ -28,12 +28,9 @@ const nextConfig: NextConfig = {
             "./docs/ja/*.md",
             "./docs/tw/*.md",
         ],
-        "/sitemap.xml": [
-            "./docs/en/*.md",
-            "./docs/cn/*.md",
-            "./docs/ja/*.md",
-            "./docs/tw/*.md",
-        ],
+        // sitemap.xml needs no docs include of its own: the docs globs above
+        // already live in the same ssr-node handler, and repeating them made
+        // EdgeOne copy one file twice at once, which fails the build.
     },
     // The bundled draw.io is about 15 files that load one after another.
     // Next serves public files with max-age=0: without this header each
